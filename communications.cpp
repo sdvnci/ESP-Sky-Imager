@@ -92,7 +92,7 @@ bool WifiSpec::wifiConnectionSetup(fs::FS& fs, SensorContainer::Status& status) 
 }
 
 /**
- * Get the current time from the onboard clock.
+ * Get the current time from the onboard clock, in UTC.
  * This function will keep trying to get the time until it succeeds or the timer runs out.
  * It will print a dot every 150-250 milliseconds to indicate progress.
  * If the time is not set after the timer runs out, it will print an error message.
@@ -106,10 +106,11 @@ bool WifiSpec::getInternalTime(int timer) {
   
     do {
       time(&now);
-      localtime_r(&now, &timeinfo);
+      gmtime_r(&now, &timeinfo);
+      if (timeinfo.tm_year >= 71) break;  // 71 = year 1971
       debug(".");
       vTaskDelay(random(150, 250)/portTICK_PERIOD_MS);
-    } while (((millis() - start) <= (1000 * timer)) && (timeinfo.tm_year < 71));  // 71 = year 1971
+    } while ((millis() - start) <= (uint32_t)(1000 * timer));
     debugln("Done");
     
     if (timeinfo.tm_year < 71) {
@@ -124,12 +125,20 @@ bool WifiSpec::getInternalTime(int timer) {
 /**
  * Set the internal clock of the ESP32 to the current time using NTP AND fill the timeinfo struct with that time.
  * Big thanks to Andreas Spiess.
+ * @param timeoutMs How long to wait for the NTP server before giving up.
+ * @return true if the clock was set, false on timeout.
  */
-void WifiSpec::setClock(void) {
+bool WifiSpec::setClock(uint32_t timeoutMs) {
     configTime(0, 0, "pool.ntp.org");
     debug(F("Waiting for NTP time sync: "));
+
+    const uint32_t start = millis();
     time_t nowSecs = time(nullptr);
     while (nowSecs < 1577836800) {  // January 1, 2020 - reasonable minimum
+        if (millis() - start > timeoutMs) {
+            debugln(F(" timed out."));
+            return false;
+        }
         vTaskDelay(500/portTICK_PERIOD_MS);
         debug(F("."));
         nowSecs = time(nullptr);
@@ -139,180 +148,175 @@ void WifiSpec::setClock(void) {
     gmtime_r(&nowSecs, &timeinfo);
     debug(F("Current time: "));
     debug(asctime(&timeinfo));
+    return true;
 }
+
+
+namespace {
+    /**
+     * Owns an HTTPClient for one request, so end() runs however the request exits.
+     */
+    class HttpSession {
+        public:
+            explicit HttpSession(const std::string& url) {
+                _client.begin(url.c_str());
+                _client.setConnectTimeout(CONN_TIMEOUT);
+                _client.setTimeout(READ_TIMEOUT);
+            }
+
+            ~HttpSession() { _client.end(); }
+
+            HttpSession(const HttpSession&) = delete;
+            HttpSession& operator=(const HttpSession&) = delete;
+
+            HTTPClient& client(void) { return _client; }
+
+        private:
+            HTTPClient _client;
+    };
+}
+
 
 /**
- * Some a JSON string to the server as a POST request.
- * @param url The URL to send the JSON data to.
- * @param jsonData The JSON data to send.
- * @return The response from the server as a json-encoded string.
+ * POST (when body is set) or GET a JSON request with the station's headers.
+ * @param url The URL to send the request to.
+ * @param body The JSON body to POST, or nullptr to GET.
+ * @param timestamp Value for the X-Timestamp header. Empty means now.
+ * @return The server's response, or a negative code if the request never completed.
  */
-std::string WifiSpec::sendJson(
-    const std::string& url,
-    const std::string& jsonData
-) {
-
+HttpResponse WifiSpec::request(const std::string& url, const std::string* body, const std::string& timestamp) {
     getInternalTime(5);
 
-    HTTPClient webclient;
-    webclient.begin(url.c_str());
+    HttpSession session(url);
+    HTTPClient& webclient = session.client();
 
-    char contentlength[10];
-    snprintf(contentlength, sizeof(contentlength), "%zu", jsonData.length());
-
-    webclient.setConnectTimeout(CONN_TIMEOUT);
     webclient.addHeader(ServerInfo::Header::CONTENT_TYPE, ServerInfo::MIMEType::APP_JSON);
-    webclient.addHeader(ServerInfo::Header::CONTENT_LENGTH, contentlength);
     webclient.addHeader(ServerInfo::Header::MACADDRESS, WiFi.macAddress().c_str());
-    webclient.addHeader(ServerInfo::Header::TIMESTAMP, formatTime(timeinfo).c_str());
+    webclient.addHeader(ServerInfo::Header::TIMESTAMP, timestamp.empty() ? formatTime(timeinfo).c_str() : timestamp.c_str());
     webclient.addHeader(ServerInfo::Header::FIRMWARE_VERSION, VERSION);
 
-    int httpCode = webclient.POST(jsonData.c_str());
-    if (httpCode < 0) {
-        char errorMsg[100];
-        snprintf(errorMsg, sizeof(errorMsg), "{\"error\: %d, \"message\": %s}\n",
-                 httpCode,
-                 webclient.errorToString(httpCode).c_str());
-        webclient.end();
-        return std::string(errorMsg);
+    HttpResponse response;
+    response.code = body ? webclient.POST(body->c_str()) : webclient.GET();
+
+    if (response.code < 0) {
+        debugf("Request to %s failed: %s\n", url.c_str(), webclient.errorToString(response.code).c_str());
+        return response;
     }
 
-    std::string response = webclient.getString().c_str();
-    
-    webclient.end();
+    response.body = webclient.getString().c_str();
     return response;
 }
+
+
+/**
+ * POST a JSON string to the server.
+ * @param url The URL to send the JSON data to.
+ * @param jsonData The JSON data to send.
+ * @param timestamp Value for the X-Timestamp header - when the data was recorded. Empty means now.
+ * @return The server's response.
+ */
+HttpResponse WifiSpec::sendJson(
+    const std::string& url,
+    const std::string& jsonData,
+    const std::string& timestamp
+) {
+    return request(url, &jsonData, timestamp);
+}
+
 
 /**
  * Send a GET request to the given url expecting a JSON response.
  * @param url the url to send the request to.
- * @return the response from the server as a json-encoded string.
+ * @return The server's response.
  */
-std::string WifiSpec::getJson(const std::string& url) {
-
-    getInternalTime(5);
-
-    HTTPClient webclient;
-    webclient.begin(url.c_str());
-    webclient.setConnectTimeout(CONN_TIMEOUT);
-    webclient.addHeader(ServerInfo::Header::CONTENT_TYPE, ServerInfo::MIMEType::APP_JSON);
-    webclient.addHeader(ServerInfo::Header::MACADDRESS, WiFi.macAddress().c_str());
-    webclient.addHeader(ServerInfo::Header::TIMESTAMP, formatTime(timeinfo).c_str());
-    webclient.addHeader(ServerInfo::Header::FIRMWARE_VERSION, VERSION);
-
-    int httpCode = webclient.GET();
-    if (httpCode < 0) {
-        char errorMsg[200];
-        snprintf(errorMsg, sizeof(errorMsg), "{\"error\: %d, \"message\": %s}\n",
-                 httpCode,
-                 webclient.errorToString(httpCode).c_str());
-        webclient.end();
-        return std::string(errorMsg);
-    }
-
-    std::string response = webclient.getString().c_str();
-    
-    webclient.end();
-    return response;
+HttpResponse WifiSpec::getJson(const std::string& url) {
+    return request(url, nullptr, "");
 }
+
 
 /**
  * Check if the server is reachable.
+ * @param netIntf The network interface to use for the request.
  * @return true if the server is reachable, false otherwise.
  */
-[[nodiscard]]
-bool ServerInfo::websiteReachable(void) const {
+bool ServerInfo::websiteReachable(WifiSpec& netIntf) const {
+    debugf("Checking if server is reachable at %s\n", url(Route::INDEX).c_str());
 
-    size_t length = this->host.length() + strlen(Route::INDEX) + 10;
-    char url[length];
-    snprintf(url, length, "%s%s", this->host.c_str(), Route::INDEX);
-
-    debugf("Checking if server is reachable at %s\n", url);
-
-    HTTPClient webclient;
-    webclient.setTimeout(CONN_TIMEOUT);
-    webclient.begin(url);
-    const int httpCode = webclient.GET();
-    webclient.end();
-
-    if (httpCode == 200) {
+    const HttpResponse response = netIntf.getJson(url(Route::INDEX));
+    if (response.code == 200) {
         debugln(">> Server is reachable.\n");
         return true;
     }
-    
-    debugf(">> Server is not reachable. HTTP code: %d\n\n", httpCode);
+
+    debugf(">> Server is not reachable. HTTP code: %d\n\n", response.code);
     return false;
 }
+
 
 /**
  * Send the status of the sensors to the server.
  * @param netIntf The network interface to use for the request.
  * @param status The sensor status struct to send.
+ * @return The server's response.
  */
-void ServerInfo::sendStatuses(
+HttpResponse ServerInfo::sendStatuses(
     WifiSpec& netIntf,
     const SensorContainer::Status& status
 ) const {
-
-    size_t length = this->host.length() + strlen(Route::STATUS) + 10;
-    char url[length];
-    snprintf(url, length, "%s%s", this->host.c_str(), Route::STATUS);
-
-    debugf("Sending Statuses to %s\n", url);
-    std::string jsonData = status.toJson();
-    std::string response = netIntf.sendJson(url, jsonData);
-    debugf("Response: %s\n", response.c_str());
+    debugf("Sending Statuses to %s\n", url(Route::STATUS).c_str());
+    const HttpResponse response = netIntf.sendJson(url(Route::STATUS), status.toJson());
+    debugf("Response %d: %s\n", response.code, response.body.c_str());
+    return response;
 }
 
+
 /**
- * Send a reading to the server.
+ * Send a reading to the server, stamped with the time it was taken.
  * @param netIntf The network interface to use for the request.
  * @param envdata The environmental data to send.
+ * @return The server's response.
  */
-void ServerInfo::sendReading(
+HttpResponse ServerInfo::sendReading(
     WifiSpec& netIntf,
     const EnvironmentalReading& envdata
 ) const {
-    size_t length = this->host.length() + strlen(Route::READING) + 10;
-    char url[length];
-    snprintf(url, length, "%s%s", this->host.c_str(), Route::READING);
-
-    debugf("Sending Reading to %s\n", url);
-    std::string jsonData = envdata.toJson();
-    std::string response = netIntf.sendJson(url, jsonData);
-    debugf("Response: %s\n", response.c_str());
+    debugf("Sending Reading to %s\n", url(Route::READING).c_str());
+    // The server takes the reading's time from the header, so a logged
+    // reading sent later must carry its own timestamp, not the send time.
+    const HttpResponse response = netIntf.sendJson(url(Route::READING), envdata.toJson(), envdata.timestamp);
+    debugf("Response %d: %s\n", response.code, response.body.c_str());
+    return response;
 }
 
+
 /**
- * Get the qnh from the server as JSON.
+ * Get the QNH from the server.
  * @param netInf The network interface settings to use for the request.
- * @return The json-encoded string containing the qnh.
+ * @return QNH in hPa, or nothing if the server didn't provide one.
  */
-std::string ServerInfo::getQnh(WifiSpec& netInf) const {
-    
-    size_t length = this->host.length() + strlen(Route::QNH) + 10;
-    char url[length];
-    snprintf(url, length, "%s%s", this->host.c_str(), Route::QNH);
+std::optional<float> ServerInfo::fetchQnh(WifiSpec& netInf) const {
+    debugf("Getting QNH from %s\n", url(Route::QNH).c_str());
+    const HttpResponse response = netInf.getJson(url(Route::QNH));
+    debugf("Response %d: %s\n", response.code, response.body.c_str());
+    if (!response.ok()) return std::nullopt;
 
-    debugf("Getting QNH from %s\n", url);
-    std::string response = netInf.getJson(url);
-    debugf("Response: %s\n", response.c_str());
-    return response;
+    JsonDocument doc;
+    if (deserializeJson(doc, response.body)) return std::nullopt;
+
+    const JsonVariant qnh = doc["qnh"];
+    if (!qnh.is<float>()) return std::nullopt;
+    return qnh.as<float>();
 }
+
 
 /**
- *Get the firmware version from the server as JSON.
+ * Get the firmware version from the server as JSON.
  * @param netInf The network interface to use for the request.
- * @return A json-encoded string containing the firmware version.
+ * @return The server's response.
  */
-std::string ServerInfo::getFirmwareVersion(WifiSpec& netInf) const {
-    size_t length = this->host.length() + strlen(Route::VERSIONING) + 10;
-    char url[length];
-    snprintf(url, length, "%s%s", this->host.c_str(), Route::VERSIONING);
-
-    debugf("Getting firmware version from %s\n", url);
-    std::string response = netInf.getJson(url);
-    debugf("Response: %s\n", response.c_str());
+HttpResponse ServerInfo::getFirmwareVersion(WifiSpec& netInf) const {
+    debugf("Getting firmware version from %s\n", url(Route::VERSIONING).c_str());
+    const HttpResponse response = netInf.getJson(url(Route::VERSIONING));
+    debugf("Response %d: %s\n", response.code, response.body.c_str());
     return response;
 }
-

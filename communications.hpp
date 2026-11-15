@@ -12,12 +12,35 @@
 #include "FS.h"
 #include <cstdint>
 #include <string>
+#include <optional>
 #include <time.h>
 
 #define CONN_TIMEOUT 10000
 #define READ_TIMEOUT 5000
 #define RETRY_COUNT 30
 #define CLRF "\r\n"
+
+/** Max time to wait for an NTP sync. */
+constexpr uint32_t NTP_TIMEOUT_MS = 15000;
+
+/**
+ * @brief The outcome of an HTTP request.
+ */
+struct HttpResponse {
+    /** HTTP status code, or a negative HTTPClient error if the request never completed. */
+    int code = 0;
+    std::string body;
+
+    /** @brief The server accepted the request. */
+    bool ok(void) const { return code >= 200 && code < 300; }
+
+    /**
+     * @brief The server refused this data for good - sending it again won't help.
+     * Only bad request, conflict (already stored) and validation errors count.
+     * Other 4xx codes (eg: 404 from a wrong URL) may be fixed server-side, so they don't.
+     */
+    bool rejected(void) const { return code == 400 || code == 409 || code == 422; }
+};
 
 /**
  * This struct holds the SSID, password, connection status, and time information.
@@ -51,16 +74,18 @@ struct WifiSpec {
 
 
     /**
-     * Set the internal clock of the ESP32 to the current time using NTP AND fill the timeinfo struct with that time.
+     * Set the internal clock of the ESP32 to the current time using NTP AND fill the timeinfo struct with that time (UTC).
      * Big thanks to Andreas Spiess.
      * @brief Set the internal clock of the ESP32 to the current time using NTP.
-     * @param timeinfo: tm struct to hold the time information.
+     * @param timeoutMs How long to wait for the NTP server before giving up.
+     * @return true if the clock was set, false on timeout.
      */
-    void setClock(void);
+    [[nodiscard]]
+    bool setClock(uint32_t timeoutMs = NTP_TIMEOUT_MS);
 
 
     /**
-     * Get the current time from the onboard clock.
+     * Get the current time (UTC) from the onboard clock.
      * This function will keep trying to get the time until it succeeds or the timer runs out.
      * It will print a dot every 150-250 milliseconds to indicate progress.
      * If the time is not set after the timer runs out, it will print an error message.
@@ -101,24 +126,30 @@ struct WifiSpec {
 
     /**
      * Send the provided JSON data to the specified URL. Headers are applied automatically, and time is updated before sending the request.
-     * @brief Send a JSON string to the server.
+     * @brief POST a JSON string to the server.
      * @param url The URL to send the JSON data to.
      * @param jsonData The JSON data to send.
-     * @return The response from the server as a JSON-encoded string.
+     * @param timestamp Value for the X-Timestamp header - when the data was recorded. Empty means now.
+     * @return The server's response.
      */
-    std::string sendJson(
+    HttpResponse sendJson(
         const std::string& url,
-        const std::string& jsonData
+        const std::string& jsonData,
+        const std::string& timestamp = ""
     );
 
 
     /**
-     * Send a GET request to the specified URL and return the response as a JSON string. Headers are applied automatically, and the time is updated before sending the request.
-     * @brief Get A JSON string from the server.
+     * Send a GET request to the specified URL. Headers are applied automatically, and the time is updated before sending the request.
+     * @brief GET JSON from the server.
      * @param url The URL to get the JSON data from.
-     * @return The JSON data as a string.
+     * @return The server's response.
      */
-    std::string getJson(const std::string& url);
+    HttpResponse getJson(const std::string& url);
+
+private:
+    /** POST when body is set, GET otherwise. */
+    HttpResponse request(const std::string& url, const std::string* body, const std::string& timestamp);
 };
 
 
@@ -134,7 +165,7 @@ struct ServerInfo {
     ServerInfo(
         const std::string& host = "",
         const std::string& certificate = ""
-    ) : certificate(certificate), host(host) {}
+    ) : host(host), certificate(certificate) {}
 
     /**
      * MIME types for the different types of packets.
@@ -173,45 +204,52 @@ struct ServerInfo {
         static constexpr const char* USER_AGENT = "User-Agent";
     };
 
+    /** @brief The full URL of a server route. */
+    std::string url(const char* route) const { return host + route; }
+
     /**
      * @brief Check if the server is reachable.
+     * @param netIntf The network interface to use for the request.
      * @return true if the server is reachable, false otherwise.
      */
-    bool websiteReachable(void) const;
+    [[nodiscard]]
+    bool websiteReachable(WifiSpec& netIntf) const;
 
     /**
      * Send the status of the sensors to the server.
      * @param netIntf The network interface settings to use for the request.
      * @param status The status of the sensors to send.
+     * @return The server's response.
      */
-    void sendStatuses(
+    HttpResponse sendStatuses(
         WifiSpec& netIntf,
         const SensorContainer::Status& status
     ) const;
 
     /**
-     * Send a reading to the server.
+     * Send a reading to the server, stamped with the time it was taken.
      * @param netIntf The network interface settings to use for the request.
-     * @param jsonData The JSON data to send.
+     * @param envdata The reading to send.
+     * @return The server's response.
      */
-    void sendReading(
+    HttpResponse sendReading(
         WifiSpec& netIntf,
         const EnvironmentalReading& envdata
     ) const;
 
     /**
-     * Get the QNH value from the server as JSON.
+     * Get the QNH value from the server.
      * @param netInf The network interface settings to use for the request.
-     * @return The QNH value as a string.
+     * @return QNH in hPa, or nothing if the server didn't provide one.
      */
-    std::string getQnh(WifiSpec& netInf) const;
+    std::optional<float> fetchQnh(WifiSpec& netInf) const;
 
     /**
      * Get the firmware version from the server as JSON.
      * @param netInf The network interface settings to use for the request.
-     * @return The firmware version as a string.
+     * @return The server's response.
      */
-    std::string getFirmwareVersion(WifiSpec& netInf) const;
+    HttpResponse getFirmwareVersion(WifiSpec& netInf) const;
 
     /**
      * @brief Load the server information from a JSON.

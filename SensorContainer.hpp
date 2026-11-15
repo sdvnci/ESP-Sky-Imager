@@ -8,6 +8,7 @@
 #include <vector>
 #include <cmath>
 #include <cstdio>
+#include <optional>
 
 
 extern unsigned long LASTPRESSED;
@@ -53,12 +54,12 @@ struct EnvironmentalReading {
         double pres = NAN,
         double alt = NAN,
         double dew = NAN
-    ): timestamp(ts), 
-       humidity(hum), 
-       temperature(temp), 
-       pressure(pres), 
-       altitude(alt), 
-       dewpoint(dew) {}
+    ): humidity(hum),
+       temperature(temp),
+       pressure(pres),
+       altitude(alt),
+       dewpoint(dew),
+       timestamp(ts) {}
 
     /**
      * Convert the Reading object to a string representation.
@@ -115,6 +116,28 @@ struct EnvironmentalReading {
         );
 
         return std::string(buffer);
+    }
+
+    /**
+     * @brief Parse a reading written by toJson(). null fields become NaN.
+     * @param json One JSON-encoded reading.
+     * @return The reading, or nothing if the JSON is invalid or has no timestamp.
+     */
+    static std::optional<EnvironmentalReading> fromJson(const std::string& json) {
+        JsonDocument doc;
+        if (deserializeJson(doc, json)) return std::nullopt;
+
+        const char* timestamp = doc["timestamp"];
+        if (timestamp == nullptr) return std::nullopt;
+
+        return EnvironmentalReading(
+            timestamp,
+            doc["temperature"] | NAN,
+            doc["humidity"] | NAN,
+            doc["pressure"] | NAN,
+            doc["altitude"] | NAN,
+            doc["dewpoint"] | NAN
+        );
     }
 };
 
@@ -199,25 +222,3 @@ struct SensorContainer {
         SHT31 sht{sensorpins::I2C_BUS, sensorpins::I2C_SDA, sensorpins::I2C_SCL};
         BMP3XX bmp{sensorpins::I2C_BUS, sensorpins::I2C_SDA, sensorpins::I2C_SCL};
 };
-
-/**
- * Convert a JsonArray to a vector of EnvironmentalReading objects.
- * @param jsonarray The JsonArray to convert.
- * @return A vector of EnvironmentalReading objects.
- */
-std::vector<EnvironmentalReading> arrayFromJson(const JsonArray jsonarray);
-
-/**
- * @brief Write a new log entry to the log file.
- * @param fs The file system to use for the log.
- * @param reading The EnvironmentalReading object containing sensor data.
- * @return True if the log was successfully updated, false otherwise.
- */
-[[nodiscard]]
-bool writeLog(fs::FS& fs, const EnvironmentalReading& reading);
-
-
-
-
-
-

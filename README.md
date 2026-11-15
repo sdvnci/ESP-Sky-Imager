@@ -1,5 +1,6 @@
 # SkyDeVision Sky Imaging Station
-[![Compile](https://github.com/sudoDeVinci/ESP-Sky-Imager/actions/workflows/compile.yml/badge.svg?branch=revamp)](https://github.com/sudoDeVinci/ESP-Sky-Imager/actions/workflows/compile.yml)
+[![Compile](https://github.com/sdvnci/ESP-Sky-Imager/actions/workflows/compile.yml/badge.svg?branch=revamp)](https://github.com/sdvnci/ESP-Sky-Imager/actions/workflows/compile.yml)
+[![Unit Tests](https://github.com/sdvnci/ESP-Sky-Imager/actions/workflows/testing.yml/badge.svg?branch=revamp)](https://github.com/sdvnci/ESP-Sky-Imager/actions/workflows/testing.yml)
 ![Doxygen](/images/doxygen_badge.svg)
 
 The ESP32S3-based low-cost sky imaging station.
@@ -12,71 +13,67 @@ Wirelessly sent environmental readings and sky images enable cloud separation an
 
 # Features
 
-## WLAN Configurability
+## Configuration Files
 
-Multiple WLAN access points' details can be stored in the `networks.json` configurations file. This is a JSON file with the template:
+The station reads its settings from the root of the SD card (or LittleFS if there's no card).
+
+`networks.json` lists the WLAN access points it may join. At boot it scans for networks and connects to the first match, in the order listed:
 
 ```json
 {
     "networks": [
-        {
-            "SSID": "Your network name",
-            "PASS": "Your network password"
-        },
-        {
-            "SSID": "Another network name",
-            "PASS": "Another network password"
-        }
+        { "ssid": "Your network name", "pass": "Your network password" },
+        { "ssid": "Another network name", "pass": "Another network password" }
     ]
 }
 ```
 
-During setup, the station scans the area for access points, and will attempt to connect to access points with details matching those listed, starting from the top. You can see this in `wifiSetup` in [comm.cpp](/comm.cpp).
+`server.json` holds the server's base URL, including the scheme and port. Requests go to `<host>/api/...`:
 
-## Value Caching To reduce cost and traffic
+```json
+{ "host": "http://192.168.1.10:5000", "certificate": "" }
+```
 
-The system implements multi-level caching to optimize performance and reduce network usage:
+`certificate` is read but not used yet, so use plain HTTP for now.
 
-- NTP time synchronization data is cached for 6 hours
-- QNH (atmospheric pressure) values from external APIs are cached for 2 hours
-- When offline, readings and images are stored locally in structured log files
-- All cached data is automatically synchronized when connectivity is restored
+Schedule, timezone and cache lifetimes are set in [StationConfig.hpp](/StationConfig.hpp).
 
-## File system agnostic usage
+## Wake Cycle
 
-The station is designed to work with different storage options:
+The station spends almost all its time in deep sleep. Each wake:
 
-- Primarily uses SD_MMC (SD card) for storage when available
-- Falls back to internal LittleFS if SD card is not detected
-- Maintains consistent file operations across both file systems
-- Automatically creates and manages required directories and files
+1. If the clock is set and it's outside operating hours (06:00–21:00 local by default), it goes straight back to sleep until the morning, without powering up WiFi or the sensors.
+2. Connects to WiFi and syncs the clock over NTP when it has never been set or the last sync is over 6 hours old. The RTC keeps time through deep sleep in between.
+3. Uses the cached QNH if it's under 2 hours old, otherwise fetches a new one from the server, falling back to the last known value when offline.
+4. Takes a reading and sends it, along with the sensor statuses.
+5. If the reading couldn't be delivered, appends it to the offline log. If it was delivered, uploads the backlog of logged readings, up to 50 per wake.
+6. Sleeps for 20 minutes, or until morning.
+
+Timestamps are UTC. The local timezone (`AST4`, Saint Lucia) is only used for the schedule.
+
+## Offline Log
+
+Undelivered readings go to `readings.jsonl`, one JSON reading per line. Appending doesn't read the log into memory, so it can grow without risking the heap.
+
+- Readings are uploaded oldest first, with the time they were taken, not the time they were sent.
+- A reading leaves the log only once the server accepts it, or definitively refuses it (400, 409 or 422). Any other failure, such as a timeout, a 5xx or a 404 from a wrong URL, keeps it and the rest of the backlog for the next wake.
+- The log is rewritten via a temporary file. If power is lost mid-rewrite, the next wake finishes the swap, so nothing is lost or sent twice.
+- A reading taken before the clock has ever been set is discarded, since it can't be placed in time.
+
+## Cache
+
+`cache.json` keeps the last QNH and the time of the last NTP sync, so the station doesn't hit the network on every wake. Times are stored as Unix seconds.
+
+## File System Agnostic Usage
+
+- Uses the SD card (SD_MMC) when one is present.
+- Falls back to the internal LittleFS flash otherwise.
 
 ## Graceful Failure
 
-The system includes robust error handling mechanisms:
-
-- Monitors all sensors and connectivity components
-- Continues operation with limited functionality when components fail
-- Implements timeouts for external communications
-- Logs errors and retries operations with exponential backoff
-- Automatically recovers from most error conditions without manual intervention
-
-## Offline/Online modes
-
-The station seamlessly adapts to changing network conditions:
-
-- In online mode: transmits data in real-time to configured server endpoints
-- In offline mode: stores all readings and images locally on the SD card
-- Automatically syncs cached data when connectivity is restored
-- Maintains accurate timekeeping during extended offline periods
-- Optimizes power usage based on network availability
-
-## Power Management
-
-- Implements deep sleep between readings to conserve battery
-- Configurable sleep durations with different day/night schedules
-- Wakes only during daylight hours for meaningful sky images
-- Dynamically adjusts power states based on sensor requirements
+- Each sensor is initialised independently, and its status is reported to the server. A failed SHT31 falls back to the BMP390 for temperature.
+- Every network wait has a timeout: WiFi connection, NTP sync, and HTTP connect and read.
+- Without WiFi or a server, readings are kept in the offline log.
 
 ## *COMING SOON*: Configurations Portal
 - Web-based configuration interface
@@ -117,6 +114,22 @@ arduino-cli lib install --git-url https://github.com/sdvnci/ESP-Environment-Driv
 ```
 
 CI installs the same pinned version (see [compile.yml](/.github/workflows/compile.yml)).
+
+## Testing
+
+[`tests/`](/tests) runs on a PC with [EpoxyDuino](https://github.com/bxparks/EpoxyDuino) and [AUnit](https://github.com/bxparks/AUnit). It covers the offline log, the cache, the schedule, reading serialisation, and the sensor path, using an in-memory stand-in for the ESP32 file system ([`tests/stubs/FS.h`](/tests/stubs/FS.h)) and the drivers' simulated I2C bus. The firmware build ignores the folder, since Arduino only compiles the sketch root and `src/`.
+
+```bash
+mkdir -p ../deps && cd ../deps
+git clone --depth 1 --branch v1.6.0 https://github.com/bxparks/EpoxyDuino.git
+git clone --depth 1 --branch v1.7.1 https://github.com/bxparks/AUnit.git
+git clone --depth 1 --branch v7.4.2 https://github.com/bblanchon/ArduinoJson.git
+git clone --depth 1 --branch v1.0.0 https://github.com/sdvnci/ESP-Environment-Drivers.git
+cd ../ESP-Sky-Imager/tests
+make EPOXY_DUINO_DIR=../../deps/EpoxyDuino AUNIT_DIR=../../deps/AUnit \
+     ARDUINOJSON_DIR=../../deps/ArduinoJson DRIVERS_DIR=../../deps/ESP-Environment-Drivers
+./tests.out
+```
 
 ## Setup Instructions
 

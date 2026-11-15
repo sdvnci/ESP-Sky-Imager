@@ -51,50 +51,6 @@ fs::FS& determineFileSystem(void) {
 
 
 /**
- * Initialize the log file in the specified file system.
- * @param fs The file system to use for logging.
- */
-void initLogfile(fs::FS& fs) {
-    if (fs.exists(LOG_FILE)) return;
-    File file = fs.open(LOG_FILE, FILE_WRITE, true);
-    if(!file){
-        debugln("Failed to open log file for writing");
-        return;
-    }   
-
-    JsonDocument doc;
-    doc.createNestedArray("readings");
-    if( serializeJson(doc, file) == 0) debugln("Failed to write to log file");
-    else debugln("Log file Initialised");
-    file.close();
-}
-
-
-/**
- * Initialize the cache file. 
- * @param fs: The file system reference to use for the cache.
- */ 
-void initCachefile(fs::FS &fs) {
-    // Check if the cache file exists, if not create it.
-    if(fs.exists(CACHE_FILE)) return;
-    File file = fs.open(CACHE_FILE, FILE_WRITE, true);
-    if(!file){
-      debugln("Failed to open cache file for writing");
-      return;
-    }
-    
-    JsonDocument doc;
-    doc["NTP"] = "None";
-    doc["SERVER"] = "None";
-    doc.createNestedObject("QNH");
-    doc["QNH"]["value"] = 0;
-    doc["QNH"]["timestamp"] = "None";
-    if( serializeJson(doc, file) == 0) debugln("Failed to write to cache file");
-    else debugln("Cache file Initialised");
-    file.close();
-}
-
-/**
  * @brief   Read the contents of a file from the specified file system.
  * @warning This dynamically allocates memory for the file contents - for our use case, this is fine though.
  * @param   fs The file system to read from.
