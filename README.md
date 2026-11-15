@@ -87,14 +87,40 @@ The station seamlessly adapts to changing network conditions:
 ## Hardware Requirements
 
 - Compatible ESP32-S3 with OV5640 camera
-- SHT31 temperature and humidity sensor
-- BMP390 barometric pressure sensor
+- SHT31 temperature and humidity sensor (I2C address 0x44)
+- BMP390 barometric pressure sensor (I2C address 0x77)
 - SD card module (recommended 16GB+)
 - Optional SSD1306 display for status information
 
+## Sensor Wiring
+
+The SHT31 and BMP390 share I2C bus 0:
+
+| Signal | GPIO |
+|---|---|
+| SDA | 41 |
+| SCL | 42 |
+
+The pins are set in `sensorpins` in [SensorContainer.hpp](/SensorContainer.hpp). The camera's SCCB bus is separate (see [camera_pins.h](/camera_pins.h)).
+
+The sensors are driven by [ESP-Environment-Drivers](https://github.com/sdvnci/ESP-Environment-Drivers), which serialises I2C traffic per bus so the sensors can be read safely from more than one FreeRTOS task. Each reading averages 20 samples per sensor with outliers removed. Temperature comes from the SHT31, falling back to the BMP390 if the SHT31 is down. Pressure is sent in hPa, and altitude is computed from the server's QNH.
+
+## Building
+
+Install the dependencies, then build for an ESP32-S3 board on the [arduino-esp32](https://github.com/espressif/arduino-esp32) core:
+
+- [ArduinoJson](https://arduinojson.org/) from the Library Manager.
+- [ESP-Environment-Drivers](https://github.com/sdvnci/ESP-Environment-Drivers) v1.0.0. Download the `v1.0.0` release as a ZIP and use *Sketch → Include Library → Add .ZIP Library*, or run:
+
+```bash
+arduino-cli lib install --git-url https://github.com/sdvnci/ESP-Environment-Drivers.git#v1.0.0
+```
+
+CI installs the same pinned version (see [compile.yml](/.github/workflows/compile.yml)).
+
 ## Setup Instructions
 
-1. Connect hardware components according to the pin definitions in [camera_pins.h](/camera_pins.h)
+1. Connect hardware components according to the pin definitions in [camera_pins.h](/camera_pins.h) and the sensor wiring above
 2. Create a `networks.json` file with your WiFi credentials
 3. Flash the firmware to your ESP32-S3 device
 4. Place the device in a weather-protected enclosure with the camera facing the sky

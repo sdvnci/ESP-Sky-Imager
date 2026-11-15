@@ -1,8 +1,7 @@
 #pragma once
 
 #include "io.hpp"
-#include "ESP-Environment-Drivers/SHT31D.hpp"
-#include "ESP-Environment-Drivers/BMP3xx.hpp"
+#include <ESPEnvironmentDrivers.h>
 #include "camera_pins.h"
 #include <string>
 #include <array>
@@ -12,6 +11,21 @@
 
 
 extern unsigned long LASTPRESSED;
+
+/**
+ * Sensor bus wiring. The SHT31 and BMP390 share I2C bus 0.
+ * The camera's SCCB bus (SIOD/SIOC in camera_pins.h) is separate - when the
+ * camera is brought up, give it I2C port 1 (camera_config_t::sccb_i2c_port)
+ * so it doesn't claim this bus.
+ */
+namespace sensorpins {
+    constexpr uint8_t I2C_BUS = 0;
+    constexpr uint8_t I2C_SDA = 41;
+    constexpr uint8_t I2C_SCL = 42;
+};
+
+/** Samples averaged (outliers removed) per reading. */
+constexpr uint16_t READING_SAMPLES = 20;
 
 struct EnvironmentalReading {
     private:
@@ -104,15 +118,6 @@ struct EnvironmentalReading {
     }
 };
 
-/**
- * Calculate the dew point from a Reading object.
- * The formula used is the Magnus-Tetens approximation.
- * @param reading The EnvironmentalReading object containing temperature and humidity.
- * @return The calculated dew point in degrees Celsius.
- */
-double calculateDewPoint(EnvironmentalReading& reading);
-
-
 
 struct SensorContainer {
     public:
@@ -149,7 +154,23 @@ struct SensorContainer {
             }
         } status;
 
-        SensorContainer(void){;}
+        SensorContainer(void) = default;
+
+        /**
+         * @brief Initialise the SHT31 and BMP390 and record which came up in status.
+         * @return true if at least one sensor is working.
+         */
+        bool begin(void);
+
+        /**
+         * @brief Take a reading, averaging READING_SAMPLES samples per sensor with outliers removed.
+         * Temperature comes from the SHT31 (more accurate for air), falling back to the BMP390.
+         * Sensors that are down, or fail every sample, leave their fields as NaN.
+         * @param timestamp Timestamp to stamp the reading with.
+         * @param qnhHpa Sea-level pressure in hPa for the altitude, or NaN to skip altitude.
+         * @return The reading.
+         */
+        EnvironmentalReading read(const std::string& timestamp, float qnhHpa);
 
         /**
          * Check if all sensors are down.
@@ -159,7 +180,7 @@ struct SensorContainer {
          * @return true if all sensors are down, false otherwise.
          */
         bool allDown(void) const {
-            return !status.SHT && !status.WIFI;
+            return !status.SHT && !status.BMP && !status.WIFI;
         }
 
 
@@ -171,8 +192,12 @@ struct SensorContainer {
          * @return true if all sensors are operational, false otherwise.
          */
         bool allUp(void) const {
-            return status.SHT && status.WIFI;
+            return status.SHT && status.BMP && status.WIFI;
         }
+
+    private:
+        SHT31 sht{sensorpins::I2C_BUS, sensorpins::I2C_SDA, sensorpins::I2C_SCL};
+        BMP3XX bmp{sensorpins::I2C_BUS, sensorpins::I2C_SDA, sensorpins::I2C_SCL};
 };
 
 /**
