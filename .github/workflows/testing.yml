@@ -1,0 +1,36 @@
+name: Unit Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Fetch test dependencies
+        run: |
+          mkdir -p ../deps
+          git clone --depth 1 --branch v1.6.0 https://github.com/bxparks/EpoxyDuino.git ../deps/EpoxyDuino
+          git clone --depth 1 --branch v1.7.1 https://github.com/bxparks/AUnit.git ../deps/AUnit
+          git clone --depth 1 --branch v7.4.2 https://github.com/bblanchon/ArduinoJson.git ../deps/ArduinoJson
+          git clone --depth 1 --branch v1.0.0 https://github.com/sdvnci/ESP-Environment-Drivers.git ../deps/ESP-Environment-Drivers
+
+      - name: Build and run tests
+        run: |
+          cd tests
+          make -j"$(nproc)" \
+            EPOXY_DUINO_DIR=../../deps/EpoxyDuino \
+            AUNIT_DIR=../../deps/AUnit \
+            ARDUINOJSON_DIR=../../deps/ArduinoJson \
+            DRIVERS_DIR=../../deps/ESP-Environment-Drivers
+          ./tests.out | tee results.txt
+          grep -q " 0 failed" results.txt
